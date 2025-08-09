@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# encryptic: Mini controlador para cifrado PGP + hash SHA-[512|256] + timestamp SINPE
+# Requisitos: gpg, openssl, curl, bash 4+
+#
+# Uso resumido:
+#   encryptic [--sha256|--sha512]
+#   encryptic -l
+#   encryptic -s <numero_de_subllave>
+#   encryptic -e <archivo> [-c|-h|-t|-f]
+#     -c : (cipher) solo encripta ASCII armored -> .asc
+#     -h : (hash)   solo genera hash (.sha256|.sha512)
+#     -t : (tsa)    solo genera timestamp TSA SINPE (.tsq .tsr)
+#     -f : (full)   encripta + hash + timestamp  [por defecto si omites el modo]
+#
+# Selección del algoritmo de hash:
+#   - Flags globales: --sha256 o --sha512
+#   - Variable de entorno: ENCRYPTIC_HASH_ALG=sha256|sha512  (por defecto: sha512)
+#
+# Nota: Para elegir una subllave específica para cifrar, primero ejecuta:
+#   encryptic -l
+#   encryptic -s <n>   # selecciona por índice la SUBLLAVE [E]
+#
+set -Eeuo pipefail
+
+VERSION="2.0.0"
+
+#------------- utilidades -------------#
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/encryptic"
+CONFIG_FILE="$CONFIG_DIR/config"
+SINPE_TSA_URL="${ENCRYPTIC_TSA_URL:-http://tsa.sinpe.fi.cr/tsaHttp/}"
+BOLD="\e[1m"; RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; RESET="\e[0m"
+
+msg()  { echo -e "${BOLD}$*${RESET}"; }
+ok()   { echo -e "${GREEN}${BOLD}$*${RESET}"; }
+warn() { echo -e "${YELLOW}${BOLD}$*${RESET}"; }
+err()  { echo -e "${RED}${BOLD}$*${RESET}" >&2; }
+die()  { err "$*"; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "Falta dependencia: $1"; }
+
+#------------- dependencias -------------#
+need gpg
+need openssl
+need curl
+
+mkdir -p "$CONFIG_DIR"
+umask 077
+
+#------------- selección de hash -------------#
+HASH_ALG="${ENCRYPTIC_HASH_ALG:-sha512}"
+while (( $# )); do
+  case "${1:-}" in
+    --sha256) HASH_ALG="sha256"; shift;;
+    --sha512) HASH_ALG="sha512"; shift;;
+    *) break;;
+  esac
+done
+
+case "$HASH_ALG" in
+  sha256|sha512) : ;;
+  *) die "Algoritmo de hash no soportado: $HASH_ALG (usa sha256 o sha512)";;
+esac
+
+# Comando para hash (Linux o macOS)
+HASH_CMD=""
+if command -v "${HASH_ALG}sum" >/dev/null 2>&1; then
+  HASH_CMD="${HASH_ALG}sum"      # sha256sum / sha512sum
+elif command -v shasum >/dev/null 2>&1; then
+  # ENCRYPTIC_HASH_ALG=sha256 -> shasum -a 256
+  # ENCRYPTIC_HASH_ALG=sha512 -> shasum -a 512
+  HASH_CMD="shasum -a ${HASH_ALG#sha}"
+else
+  die "No se encontró ${HASH_ALG}sum ni shasum. Instala coreutils o usa shasum."
+fi
+
+#------------- helpers GPG (listar subllaves [E]) -------------#
+# Salida: "sub_fpr|uid|pub_fpr|caps"
+gpg_list_encrypt_subkeys() {
+  gpg --list-keys --with-colons --fingerprint 2>/dev/null | \
+  awk -F: '
+    $1=="pub" { inpub=1; pubfpr=""; uid=""; next }
+    $1=="fpr" && inpub && pubfpr=="" { pubfpr=$10; next }
+    $1=="uid" && inpub && uid==""   { uid=$10; next }
+    $1=="sub" { insub=1; caps=$12; next }
+    $1=="fpr" && insub {
+      sfpr=$10
+      # Mostrar sólo subllaves con capacidad de cifrado (e o E)
+      if (caps ~ /[eE]/) { printf "%s|%s|%s|%s\n", sfpr, uid, pubfpr, caps }
+      insub=0; next
+    }
+  '
+}
+
+print_subkeys_numbered() {
+  local i=1
+  if ! mapfile -t LINES < <(gpg_list_encrypt_subkeys); then
+    die "No se pudieron listar las subllaves."
+  fi
+  if (( ${#LINES[@]} == 0 )); then
+    warn "No hay subllaves con capacidad de cifrado [E] disponibles en GnuPG."
+    echo "Importa o genera llaves con subllave de cifrado, o revisa su estado (expiración, revocación)."
+    return 1
+  fi
+  for line in "${LINES[@]}"; do
+    local sfpr uid pfpr caps
+    IFS='|' read -r sfpr uid pfpr caps <<<"$line"
+    printf "%2d) %s\n    ↳ sub[E] %s  (pub %s)  caps:%s\n" "$i" "$uid" "$sfpr" "$pfpr" "$caps"
+    ((i++))
+  done
+  return 0
+}
+
+get_subfpr_by_index() {
+  local idx="$1"
+  local i=1
+  while IFS= read -r line; do
+    if [[ $i -eq $idx ]]; then
+      echo "${line%%|*}"
+      return 0
+    fi
+    ((i++))
+  done < <(gpg_list_encrypt_subkeys)
+  return 1
+}
+
+#------------- configuración (guardar selección) -------------#
+save_selected_subkey() {
+  local fpr="$1"
+  local tmp
+  tmp="$(mktemp "${CONFIG_FILE}.XXXXXX")"
+  # preserva otras variables, elimina líneas KEY_FPR o SUBKEY_FPR previas
+  grep -Ev '^(KEY_FPR|SUBKEY_FPR)=' "$CONFIG_FILE" 2>/dev/null > "$tmp" || true
+  echo "SUBKEY_FPR=$fpr" >> "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+load_selected_subkey() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+#------------- operaciones -------------#
+cmd_list() {
+  msg "Subllaves disponibles para cifrar [E]:"
+  print_subkeys_numbered || return 1
+}
+
+cmd_select() {
+  local idx="${1:-}"
+  [[ -z "$idx" ]] && die "Uso: encryptic -s <numero_de_subllave>"
+  [[ "$idx" =~ ^[0-9]+$ ]] || die "El índice debe ser numérico."
+  local sfpr
+  if ! sfpr="$(get_subfpr_by_index "$idx")" || [[ -z "$sfpr" ]]; then
+    die "Índice inválido o no se encontraron subllaves."
+  fi
+  save_selected_subkey "$sfpr"
+  ok "Subllave seleccionada: $sfpr"
+}
+
+do_encrypt_only() {
+  local file="$1"
+  load_selected_subkey
+  local sfpr="${SUBKEY_FPR:-}"
+  [[ -n "$sfpr" ]] || die "No hay subllave seleccionada. Ejecuta: encryptic -l  y luego  encryptic -s <numero>"
+
+  local out="${file}.asc"
+  if [[ -e "$out" ]]; then
+    die "Ya existe el archivo de salida: $out (elimina o renombra para continuar)"
+  fi
+  msg "Encriptando (ASCII armored) -> $out"
+  # Forzar uso exacto de esa subllave
+  gpg --yes --batch --armor --recipient "${sfpr}!" --output "$out" --encrypt -- "$file" \
+    || die "Fallo al encriptar con GPG."
+  # Chequeo rápido de armor
+  if ! head -n1 "$out" | grep -q '^-----BEGIN PGP MESSAGE-----$'; then
+    die "La salida no es ASCII-armored como se esperaba."
+  fi
+  ok "Listo: $out"
+}
+
+do_hash_only() {
+  local file="$1"
+  local sha_file="${file}.${HASH_ALG}"
+  if [[ -e "$sha_file" ]]; then
+    die "Ya existe: $sha_file (elimina o renombra para continuar)"
+  fi
+  msg "Generando ${HASH_ALG^^} -> $sha_file"
+  if [[ "$HASH_CMD" =~ ^shasum ]]; then
+    $HASH_CMD -- "$file" > "$sha_file" || die "No se pudo generar el hash ${HASH_ALG^^}."
+  else
+    $HASH_CMD -- "$file" > "$sha_file" || die "No se pudo generar el hash ${HASH_ALG^^}."
+  fi
+  ok "Listo: $sha_file"
+}
+
+do_timestamp_only() {
+  local file="$1"
+  local tsq="${file}.tsq"
+  local tsr="${file}.tsr"
+  if [[ -e "$tsq" || -e "$tsr" ]]; then
+    die "Ya existe .tsq o .tsr (elimina o renombra para continuar)"
+  fi
+  msg "Creando solicitud de sello de tiempo (openssl ts -query -${HASH_ALG}) -> $tsq"
+  openssl ts -query -data "$file" -no_nonce -"${HASH_ALG}" -cert -out "$tsq" \
+    || die "No se pudo crear la solicitud TSA (.tsq)."
+  msg "Enviando solicitud a TSA de SINPE -> $tsr"
+  curl -sS --fail -H "Content-Type: application/timestamp-query" \
+       -H "Accept: application/timestamp-reply" \
+       --data-binary @"$tsq" "$SINPE_TSA_URL" > "$tsr" \
+    || die "Falla al contactar la TSA de SINPE."
+  if [[ ! -s "$tsr" ]]; then
+    die "La respuesta TSA (.tsr) está vacía; verifique la conectividad o la URL."
+  fi
+  ok "Listo: $tsq, $tsr"
+  echo "-> Para inspeccionar el .tsr utiliza: openssl ts -reply -in \"$tsr\" -text"
+}
+
+# Cifra/hashea/timestamp según modo (-c|-h|-t|-f). Por defecto usa -f.
+cmd_encrypt() {
+  local file="${1:-}"
+  local mode="${2:-"-f"}"
+  [[ -n "$file" ]] || die "Uso: encryptic -e <archivo> [-c|-h|-t|-f]"
+
+  case "$mode" in
+    -c) do_encrypt_only "$file" ;;
+    -h) do_hash_only    "$file" ;;
+    -t) do_timestamp_only "$file" ;;
+    -f|"")
+         do_encrypt_only "$file"
+         do_hash_only    "$file"
+         do_timestamp_only "$file"
+         ;;
+    *)
+      die "Modo inválido: $mode (usa -c, -h, -t o -f; por defecto -f)"
+      ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+--------------------------------------------------------------------------------------------------
+ encryptic v$VERSION — Mini controlador para cifrado PGP + hash (${HASH_ALG^^}) + timestamp SINPE
+--------------------------------------------------------------------------------------------------
+ AUTOR:
+   Anthony Josue Rojas Fuentes
+--------------------------------------------------------------------------------------------------
+ USO:
+   encryptic [--sha256|--sha512] -l
+       Lista las SUBLLAVES PGP con capacidad de cifrado [E] (numeradas).
+
+   encryptic [--sha256|--sha512] -s <numero_de_subllave>
+       Selecciona la subllave (por índice de la lista) para futuras operaciones.
+
+   encryptic [--sha256|--sha512] -e <archivo> [-c|-h|-t|-f]
+       Opera sobre <archivo>:
+         -c : solo cifrado ASCII armored (.asc)
+         -h : solo hash (.${HASH_ALG})
+         -t : solo timestamp TSA SINPE (.tsq/.tsr)
+         -f : (por defecto) cifrado + hash + TSA
+--------------------------------------------------------------------------------------------------
+ NOTAS:
+   - Algoritmo de hash por defecto: sha512. 
+   - Puedes cambiar el algoritmo de hash usando: --sha256 o ENCRYPTIC_HASH_ALG=sha256.
+   - TSA: ${SINPE_TSA_URL}
+   - El hash y timestamp se realizan sobre el archivo ORIGINAL (no sobre el .asc).
+   - El .config que guarda el fingerprint se encuentra en $CONFIG_FILE
+--------------------------------------------------------------------------------------------------
+EOF
+}
+
+#------------- main -------------#
+if (( $# == 0 )); then
+  usage
+  exit 0
+fi
+
+case "${1:-}" in
+  -l|--list)        shift; cmd_list "$@";;
+  -s|--select)      shift; cmd_select "${1:-}";;
+  -e|--encrypt)     shift; cmd_encrypt "${1:-}" "${2:-"-f"}";;
+  -h|--help)        usage;;
+  -v|--version)     echo "encryptic v$VERSION";;
+  *)
+    err "Opción no reconocida: $1"
+    usage
+    exit 1
+    ;;
+esac
+
